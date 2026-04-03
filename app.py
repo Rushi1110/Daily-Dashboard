@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import json
+import requests
 import datetime
 import pytz
 import re
@@ -34,6 +34,29 @@ def parse_duration_to_seconds(duration_str):
     except:
         return 0
 
+# --- API CONNECTION ---
+@st.cache_data(ttl=600) # Caches the Glide data for 10 minutes
+def fetch_glide_data():
+    url = "https://api.glideapp.io/api/function/queryTables"
+    
+    headers = {
+        "Authorization": st.secrets["GLIDE_API_TOKEN"]
+    }
+    
+    payload = {
+        "appID": "zKbZpeBo5f2rDnkRshIq",
+        "queries": [
+            {
+                "tableName": "native-table-1L4wPB53vJM273qy7HAu",
+                "utc": True
+            }
+        ]
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()
+
 # --- SIDEBAR: DATE FILTERS ---
 st.sidebar.header("Dashboard Filters")
 ist = pytz.timezone('Asia/Kolkata')
@@ -43,27 +66,22 @@ yesterday = today - datetime.timedelta(days=1)
 start_date = st.sidebar.date_input("Start Date", yesterday)
 end_date = st.sidebar.date_input("End Date", yesterday)
 
-# --- FILE UPLOADS ---
+
+# --- MAIN APP FLOW ---
 st.title("📊 Jumbo Homes Lead Dashboard")
-st.markdown("Upload your latest **Glide JSON** and **Callyzer CSV** dumps below to generate the dashboard.")
 
-col1, col2 = st.columns(2)
-with col1:
-    glide_file = st.file_uploader("Upload Glide Data (data.json)", type=['json'])
-with col2:
-    callyzer_file = st.file_uploader("Upload Callyzer Report (.csv)", type=['csv'])
-
-if glide_file and callyzer_file:
-    with st.spinner("Processing data..."):
-        # 1. LOAD & PROCESS GLIDE DATA
-        glide_raw = json.load(glide_file)
-        # Extract rows from Glide JSON structure
+# 1. AUTOMATICALLY FETCH GLIDE DATA
+try:
+    with st.spinner("Fetching live database from Glide API..."):
+        glide_raw = fetch_glide_data()
+        
+        # Extract rows
         if isinstance(glide_raw, list) and 'rows' in glide_raw[0]:
             df_glide = pd.DataFrame(glide_raw[0]['rows'])
         else:
-            st.error("Invalid Glide JSON format.")
+            st.error("Received unexpected format from Glide API.")
             st.stop()
-
+            
         # Convert created dates to IST
         df_glide['Created_IST'] = pd.to_datetime(df_glide['z6nvn']).dt.tz_convert('Asia/Kolkata').dt.date
         
@@ -77,11 +95,19 @@ if glide_file and callyzer_file:
         mask_glide = (df_glide['Created_IST'] >= start_date) & (df_glide['Created_IST'] <= end_date)
         df_glide_filtered = df_glide[mask_glide]
 
-        # DEDUPLICATE LEADS (for Status and Source analysis)
+        # DEDUPLICATE LEADS 
         df_leads_unique = df_glide_filtered.drop_duplicates(subset=['CleanPhone'])
+        
+except Exception as e:
+    st.error(f"Failed to connect to Glide API. Error: {e}")
+    st.stop()
 
+# 2. WAIT FOR CALLYZER UPLOAD
+st.markdown("✅ **Glide data synced successfully!**")
+callyzer_file = st.file_uploader("Upload your Callyzer Report (.csv) to generate metrics", type=['csv'])
 
-        # 2. LOAD & PROCESS CALLYZER DATA
+if callyzer_file:
+    with st.spinner("Analyzing call data..."):
         df_callyzer = pd.read_csv(callyzer_file)
         
         # Parse Call Dates
@@ -94,14 +120,13 @@ if glide_file and callyzer_file:
         # Isolate Outgoing Calls
         df_outgoing = df_call_filtered[df_call_filtered['Call Type'] == 'Outgoing'].copy()
         
-        # Clean Callyzer Phone Numbers (To Number)
+        # Clean Callyzer Phone Numbers
         df_outgoing['CleanPhone'] = df_outgoing['To Number'].apply(clean_phone)
         
-        # Calculate duration in seconds
+        # Calculate duration
         df_outgoing['DurationSec'] = df_outgoing['Duration'].apply(parse_duration_to_seconds)
 
         # --- DASHBOARD METRICS & VISUALS ---
-
         st.divider()
         
         # OVERVIEW METRICS
@@ -109,10 +134,8 @@ if glide_file and callyzer_file:
         m1, m2, m3 = st.columns(3)
         
         total_unique_leads = len(df_leads_unique)
-        
-        # Database Attempt %: Unique called numbers found in Glide / Total Unique called numbers
         unique_numbers_called = df_outgoing['CleanPhone'].nunique()
-        glide_database_numbers = set(df_glide['CleanPhone'].dropna()) # Check against whole DB, not just filtered dates
+        glide_database_numbers = set(df_glide['CleanPhone'].dropna()) 
         numbers_called_in_db = df_outgoing[df_outgoing['CleanPhone'].isin(glide_database_numbers)]['CleanPhone'].nunique()
         
         db_attempt_pct = (numbers_called_in_db / unique_numbers_called * 100) if unique_numbers_called > 0 else 0
@@ -123,12 +146,11 @@ if glide_file and callyzer_file:
 
         st.divider()
 
-        # SECTION 1 & 2: LEAD ANALYSIS (Deduplicated Data)
+        # SECTION 1 & 2: LEAD ANALYSIS 
         col_table1, col_table2 = st.columns(2)
 
         with col_table1:
             st.subheader("1. Lead Owner vs Lead Status")
-            # Pivot Table: Rows = Owner, Cols = Status (WlkAx)
             if not df_leads_unique.empty:
                 status_pivot = pd.crosstab(df_leads_unique['Lead Owner'], df_leads_unique['WlkAx'], margins=True, margins_name="Total")
                 st.dataframe(status_pivot, use_container_width=True)
@@ -137,7 +159,6 @@ if glide_file and callyzer_file:
 
         with col_table2:
             st.subheader("2. Source Wise Leads")
-            # Group by Source (fYTgZ)
             if not df_leads_unique.empty:
                 source_counts = df_leads_unique['fYTgZ'].value_counts().reset_index()
                 source_counts.columns = ['Source', 'Lead Count']
@@ -147,26 +168,19 @@ if glide_file and callyzer_file:
 
         st.divider()
 
-        # SECTION 3: CALLER METRICS (Includes Duplicates for Connect Rate)
+        # SECTION 3: CALLER METRICS 
         st.subheader("3. Calling Metrics (Connect Rate & Deep Conversations)")
         
         if not df_outgoing.empty:
-            # Group by Employee Name
             caller_stats = df_outgoing.groupby('Employee Name').agg(
-                Total_Attempts=('CleanPhone', 'count'), # Counts all attempts, including duplicates
+                Total_Attempts=('CleanPhone', 'count'), 
                 Connected_Calls=('DurationSec', lambda x: (x > 0).sum()),
                 Deep_Conversations=('DurationSec', lambda x: (x > 120).sum())
             ).reset_index()
 
-            # Calculate Connect %
             caller_stats['Connect Rate %'] = ((caller_stats['Connected_Calls'] / caller_stats['Total_Attempts']) * 100).round(1)
-            
-            # Format columns for display
             caller_stats['Connect Rate %'] = caller_stats['Connect Rate %'].astype(str) + '%'
             
             st.dataframe(caller_stats, use_container_width=True)
         else:
             st.info("No outgoing calls found for the selected date range.")
-
-else:
-    st.info("👆 Please upload your data files to view the dashboard.")
